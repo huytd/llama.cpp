@@ -17,6 +17,7 @@ struct llama_moe_cache_layer {
     ggml_tensor * down_exps;
     ggml_tensor * gate_up_exps;
     bool          weight_before_ffn; // the router weights scale the expert input
+    ggml_tensor * router_inp = nullptr; // input of the router, to predict the experts of the next layers
 };
 
 // the lookup of the selected experts of a layer in the MoE cache, see llama_moe_cache::build_lookup

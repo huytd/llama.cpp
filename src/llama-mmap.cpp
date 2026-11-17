@@ -1128,11 +1128,15 @@ void llama_prefetch(llama_memory_ranges mr) {
                 llama_format_win_err(GetLastError()).c_str());
     }
 #else
+    // Linux reads at most the readahead window per call, so large ranges are split to issue all the reads at once
+    const size_t chunk = 128*1024;
     for (const auto & range : mr) {
         // TODO: in a follow-up, use posix_madvise(.., POSIX_MADV_WILLNEED) to match the rest of this file
-        if (madvise(const_cast<void *>(range.addr), range.size, MADV_WILLNEED) != 0) {
-            LLAMA_LOG_WARN("llama_prefetch: madvise(MADV_WILLNEED) failed: %s\n", strerror(errno));
-            return;
+        for (size_t off = 0; off < range.size; off += chunk) {
+            if (madvise((char *) const_cast<void *>(range.addr) + off, std::min(chunk, range.size - off), MADV_WILLNEED) != 0) {
+                LLAMA_LOG_WARN("llama_prefetch: madvise(MADV_WILLNEED) failed: %s\n", strerror(errno));
+                return;
+            }
         }
     }
 #endif
