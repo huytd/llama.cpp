@@ -9,6 +9,8 @@
 #include "ggml-cpp.h"
 
 #include <algorithm>
+#include <atomic>
+#include <memory>
 #include <condition_variable>
 #include <deque>
 #include <mutex>
@@ -22,7 +24,9 @@
 #include <vector>
 
 #ifdef __linux__
+#include <fcntl.h>
 #include <sys/mman.h>
+#include <unistd.h>
 #endif
 
 namespace {
@@ -64,6 +68,8 @@ struct moe_cache_lru {
     std::vector<int32_t> evicted; // keys evicted by the last plan()
     std::vector<int32_t> evicted_slot; // their slots
     std::vector<uint64_t> token_zero; // [n_tokens] zero slots used by each token
+    std::vector<uint32_t> spec_mark; // [n_slots] spec_mark[s] == spec_gen if filled by the current speculative round
+    uint32_t spec_gen = 1;
 
     void init(int32_t n_layer, int32_t n_expert, int32_t n_slots) {
         GGML_ASSERT(n_class == (int) std::log2(1.0f/(1.0f - std::exp2(-1.0f/crf_half_life))) + 1);
@@ -89,6 +95,7 @@ struct moe_cache_lru {
         last_use.assign((size_t) n_layer*n_expert, -1);
         clock.assign(n_layer, 0);
         seen.assign(n_expert, 0);
+        spec_mark.assign(n_slots, 0);
     }
 
     // move slot s to the most recently used end of list c
@@ -154,7 +161,7 @@ struct moe_cache_lru {
     // the least recently used slot of list c that this plan() does not select, -1 if none
     int32_t candidate(int c, int32_t il) const {
         for (int32_t s = head[c]; s >= 0; s = next[s]) {
-            if (!is_selected(il, key_of[s])) {
+            if (!is_selected(il, key_of[s]) && spec_mark[s] != spec_gen) {
                 return s;
             }
         }
@@ -190,6 +197,24 @@ struct moe_cache_lru {
         int32_t expert;
         int32_t slot;
     };
+
+    // put expert e of layer il in a slot before it is selected, keep the experts selected by the last plan() of layer il_cur
+    // it goes to class 0 without a use: if it is not selected next, it is the next victim
+    // ev is the evicted key, -1 if the slot was empty
+    int32_t insert_spec(int32_t il_cur, int32_t il, int32_t e, int32_t & ev) {
+        const int32_t s = victim(il_cur);
+        ev = key_of[s];
+        if (ev >= 0) {
+            slot_map[key_layer(ev)][key_expert(ev)] = empty;
+        } else {
+            n_filled++;
+        }
+        key_of[s] = make_key(il, e);
+        slot_map[il][e] = s;
+        move(s, 0);
+        spec_mark[s] = spec_gen;
+        return s;
+    }
 
     // give a slot to each expert selected by ids (n_tokens tokens) in layer il
     // n_cpu(n) of the n misses are left to the CPU and read a zero slot on the device, they are not cached
@@ -422,6 +447,9 @@ struct llama_moe_cache::impl {
         ggml_backend_event_ptr ev_stage; // on backend: evicted experts are in the stage slots
         ggml_backend_event_ptr ev_d2h;   // on backend_d2h: the last D2H is done
         bool d2h_pending = false;
+        std::vector<std::pair<int32_t, int32_t>> spec_unwaited; // (group, key) uploaded on backend_d2h since the last wait
+        uint64_t d2h_seq  = 0; // D2H batches queued on backend_d2h
+        uint64_t d2h_done = 0; // D2H batches known to be done
         ggml_context_ptr ctx_stage;
         ggml_backend_buffer_ptr buf_stage;
     };
@@ -440,6 +468,12 @@ struct llama_moe_cache::impl {
         std::vector<ggml_tensor *> pool_banks; // host storage of the pool slots, one per expert tensor
         std::vector<ggml_tensor *> stage_banks; // device copies of evicted experts, read by the D2H, one per expert tensor
         int32_t n_stage = 0;
+        std::vector<int32_t> spec_keys; // keys uploaded speculatively, not yet checked against the selection
+
+        // dio: pool slots written by the reader threads
+        std::unique_ptr<std::atomic<int32_t>[]> pool_busy; // [pool.n] reads in flight into the slot
+        std::vector<uint8_t>  pool_dio; // [pool.n] filled by a dio read, not used yet
+        std::vector<uint64_t> pool_d2h; // [pool.n] d2h_seq of the last D2H into the slot
     };
 
     struct layer {
@@ -490,6 +524,11 @@ struct llama_moe_cache::impl {
     };
     std::vector<pred_stats> stats_pred; // [lookahead]
 
+    // LLAMA_MOE_CACHE_SPEC=n: upload up to n predicted experts of the next layer from the pool on the pool stream, while this layer computes
+    int32_t spec = 0;
+    size_t stats_spec_up   = 0;
+    size_t stats_spec_used = 0;
+
     // the read-ahead of predicted experts runs on a worker thread, madvise can block on page allocation and I/O submit
     std::thread             ra_thread;
     std::mutex              ra_mutex;
@@ -530,6 +569,207 @@ struct llama_moe_cache::impl {
     }
     size_t stats_sel  = 0;
     size_t stats_miss = 0;
+
+    // LLAMA_MOE_CACHE_DIO=n: n threads read the predicted experts of the next layers that are not in VRAM or in the pool
+    // into pool slots, with O_DIRECT so the page cache is not used; a later miss on such an expert is a pool hit
+    int32_t dio = 0;
+    struct dio_job {
+        int fd;
+        off_t off;
+        size_t len;
+        const uint8_t * src; // mmap, used if the read fails
+        uint8_t * dst;
+        std::atomic<int32_t> * left;
+        size_t need = 0;                        // direct: aligned off and len, read into dst in place, fail if fewer than need bytes
+        std::atomic<int32_t> * fail = nullptr;  // direct if set
+    };
+
+    // LLAMA_MOE_CACHE_DDIO=n: n threads read the misses not in the pool with O_DIRECT, in chunks of LLAMA_MOE_CACHE_DDIO_CHUNK KiB,
+    // into pinned stage slots, then upload from there; up to LLAMA_MOE_CACHE_DDIO_SLOTS misses per layer, the rest go through the mmap
+    int32_t ddio       = 0;
+    size_t  ddio_chunk = 256*1024;
+    int32_t ddio_slots = 64;
+    size_t  ddio_stride = 0; // bytes per expert tensor in a stage slot
+    size_t  ddio_nt     = 0; // expert tensors per stage slot
+    ggml_backend_buffer_ptr buf_ddio;
+    uint8_t * ddio_base = nullptr;
+    std::unique_ptr<std::atomic<int32_t>[]> ddio_left; // [ddio_slots] chunks in flight
+    std::unique_ptr<std::atomic<int32_t>[]> ddio_fail; // [ddio_slots*4]
+    std::vector<int32_t> ddio_src; // [fills] stage slot an upload reads, -1 if none
+    std::deque<dio_job> dio_queue_hi; // ddio reads, before the predicted reads
+    size_t  stats_ddio_read = 0;
+    size_t  stats_ddio_fail = 0;
+    int64_t ddio_wait_us    = 0;
+    struct dio_src {
+        int fd;
+        off_t off; // file offset of the tensor data
+    };
+    std::unordered_map<const ggml_tensor *, dio_src> dio_srcs;
+    std::vector<int> dio_fds;
+    std::vector<std::thread> dio_threads;
+    std::mutex dio_mutex;
+    std::condition_variable dio_cv;
+    std::deque<dio_job> dio_queue;
+    std::vector<dio_job> dio_jobs;
+    bool   dio_stop    = false;
+    size_t dio_max_len = 0;
+    size_t stats_dio_read   = 0; // experts read
+    size_t stats_dio_used   = 0; // of them, taken by a miss
+    size_t stats_dio_unused = 0; // of them, evicted from the pool unused
+    size_t stats_dio_wait   = 0; // misses that waited for a read in flight
+    size_t stats_dio_sync   = 0;
+    size_t stats_dio_fail   = 0;
+    int64_t dio_wait_us = 0;
+
+    void dio_run() {
+        const size_t cap = GGML_PAD(dio_max_len, 4096) + 2*4096;
+        uint8_t * buf = (uint8_t *) aligned_alloc(4096, cap);
+        std::unique_lock<std::mutex> lock(dio_mutex);
+        while (true) {
+            dio_cv.wait(lock, [&] { return dio_stop || !dio_queue.empty() || !dio_queue_hi.empty(); });
+            if (dio_stop) {
+                break;
+            }
+            std::deque<dio_job> & q = !dio_queue_hi.empty() ? dio_queue_hi : dio_queue;
+            const dio_job j = q.front();
+            q.pop_front();
+            lock.unlock();
+            if (j.fail != nullptr) {
+                size_t done = 0;
+#ifdef __linux__
+                while (done < j.len) {
+                    const ssize_t r = pread(j.fd, j.dst + done, j.len - done, j.off + done);
+                    if (r <= 0) {
+                        break;
+                    }
+                    done += r;
+                }
+#endif
+                if (done < j.need) {
+                    j.fail->store(1, std::memory_order_relaxed);
+                }
+                j.left->fetch_sub(1, std::memory_order_release);
+                lock.lock();
+                continue;
+            }
+            bool ok = false;
+#ifdef __linux__
+            if (j.fd >= 0 && buf != nullptr) {
+                const off_t  beg  = j.off & ~(off_t) 4095;
+                const size_t want = GGML_PAD((size_t) (j.off - beg) + j.len, 4096);
+                size_t done = 0;
+                while (done < want) {
+                    const ssize_t r = pread(j.fd, buf + done, want - done, beg + done);
+                    if (r <= 0) {
+                        break;
+                    }
+                    done += r;
+                }
+                if (done >= (size_t) (j.off - beg) + j.len) {
+                    memcpy(j.dst, buf + (j.off - beg), j.len);
+                    ok = true;
+                }
+            }
+#endif
+            if (!ok) {
+                memcpy(j.dst, j.src, j.len);
+            }
+            j.left->fetch_sub(1, std::memory_order_release);
+            lock.lock();
+            stats_dio_fail += !ok;
+        }
+        free(buf);
+    }
+
+    // wait for the reads in flight into pool slot s
+    void pool_wait(group & g, int32_t s) {
+        if (!g.pool_busy || g.pool_busy[s].load(std::memory_order_acquire) == 0) {
+            return;
+        }
+        const int64_t t0 = ggml_time_us();
+        while (g.pool_busy[s].load(std::memory_order_acquire) > 0) {
+            std::this_thread::yield();
+        }
+        dio_wait_us += ggml_time_us() - t0;
+        stats_dio_wait++;
+    }
+
+    int32_t pool_take(group & g, int32_t key) {
+        const int32_t s = g.pool.take(key);
+        if (s >= 0 && g.pool_busy) {
+            pool_wait(g, s);
+            stats_dio_used += g.pool_dio[s];
+            g.pool_dio[s] = 0;
+        }
+        return s;
+    }
+
+    // the slot that the next insert reuses must have no read in flight
+    int32_t pool_insert(group & g, int32_t key) {
+        const int32_t s = !g.pool.free_slots.empty() ? g.pool.free_slots.back() : g.pool.head;
+        if (s >= 0 && g.pool_busy) {
+            pool_wait(g, s);
+            stats_dio_unused += g.pool_dio[s];
+            g.pool_dio[s] = 0;
+        }
+        return g.pool.insert(key);
+    }
+
+    // map the expert tensors to their files, from /proc/self/maps
+    void dio_init() {
+#ifdef __linux__
+        struct range {
+            uintptr_t beg;
+            uintptr_t end;
+            off_t off;
+            std::string path;
+        };
+        std::vector<range> ranges;
+        FILE * f = fopen("/proc/self/maps", "r");
+        if (f == nullptr) {
+            return;
+        }
+        char line[4096];
+        while (fgets(line, sizeof(line), f)) {
+            unsigned long beg;
+            unsigned long end;
+            unsigned long off;
+            char path[4096] = {};
+            if (sscanf(line, "%lx-%lx %*s %lx %*s %*s %4095[^\n]", &beg, &end, &off, path) == 4 && path[0] == '/') {
+                ranges.push_back({ beg, end, (off_t) off, path });
+            }
+        }
+        fclose(f);
+        std::unordered_map<std::string, int> fds;
+        for (const layer & l : layers) {
+            if (l.ig < 0 || (groups[l.ig].pool.n == 0 && ddio == 0)) {
+                continue;
+            }
+            for (const ggml_tensor * t : l.experts) {
+                const uintptr_t p = (uintptr_t) t->data;
+                const auto it = std::find_if(ranges.begin(), ranges.end(), [&](const range & r) { return p >= r.beg && p + ggml_nbytes(t) <= r.end; });
+                if (it == ranges.end()) {
+                    LLAMA_LOG_WARN("%s: %s is not in a file mapping, dio is disabled\n", __func__, t->name);
+                    dio_srcs.clear();
+                    return;
+                }
+                auto it_fd = fds.find(it->path);
+                if (it_fd == fds.end()) {
+                    const int fd = open(it->path.c_str(), O_RDONLY | O_DIRECT);
+                    if (fd < 0) {
+                        LLAMA_LOG_WARN("%s: failed to open %s with O_DIRECT, dio is disabled\n", __func__, it->path.c_str());
+                        dio_srcs.clear();
+                        return;
+                    }
+                    dio_fds.push_back(fd);
+                    it_fd = fds.emplace(it->path, fd).first;
+                }
+                dio_srcs[t] = { it_fd->second, it->off + (off_t) (p - it->beg) };
+                dio_max_len = std::max(dio_max_len, (size_t) t->nb[2]);
+            }
+        }
+#endif
+    }
 
     static constexpr int64_t max_batch = 32;
 
@@ -680,8 +920,30 @@ struct llama_moe_cache::impl {
         if (const char * s = getenv("LLAMA_MOE_CACHE_LOOKAHEAD_K"); s != nullptr && atoi(s) > 0) {
             lookahead_k = atoi(s);
         }
+        if (const char * s = getenv("LLAMA_MOE_CACHE_SPEC"); s != nullptr) {
+            spec = std::max(0, atoi(s));
+            if (spec > 0) {
+                lookahead = std::max(lookahead, 1);
+            }
+        }
+        if (const char * s = getenv("LLAMA_MOE_CACHE_DIO"); s != nullptr) {
+            dio = std::max(0, atoi(s));
+            if (dio > 0) {
+                lookahead = std::max(lookahead, 1);
+                spec = 0;
+            }
+        }
+        if (const char * s = getenv("LLAMA_MOE_CACHE_DDIO"); s != nullptr) {
+            ddio = std::max(0, atoi(s));
+        }
+        if (const char * s = getenv("LLAMA_MOE_CACHE_DDIO_CHUNK"); s != nullptr && atoi(s) > 0) {
+            ddio_chunk = GGML_PAD((size_t) atoi(s)*1024, 4096);
+        }
+        if (const char * s = getenv("LLAMA_MOE_CACHE_DDIO_SLOTS"); s != nullptr && atoi(s) > 0) {
+            ddio_slots = atoi(s);
+        }
         stats_pred.resize(lookahead);
-        if (lookahead > 0 && prefetch) {
+        if (lookahead > 0 && prefetch && dio == 0) {
             ra_thread = std::thread([this] { ra_run(); });
         }
         predicted.resize(model.layers.size());
@@ -898,6 +1160,62 @@ struct llama_moe_cache::impl {
             }
         }
 
+        if (ddio > 0 && no_alloc) {
+            ddio = 0;
+        }
+        if (dio > 0 && pool_size == 0) {
+            dio = 0;
+        }
+        if (dio > 0 || ddio > 0) {
+            dio_init();
+            if (dio_srcs.empty()) {
+                dio  = 0;
+                ddio = 0;
+            }
+        }
+        if (ddio > 0) {
+            size_t n_tensors = 0;
+            for (const group & g : groups) {
+                n_tensors = std::max(n_tensors, g.ref.size());
+            }
+            GGML_ASSERT(n_tensors <= 4);
+            ddio_nt = n_tensors;
+            ddio_stride = GGML_PAD(dio_max_len, 4096) + 4096;
+            ggml_backend_buffer_type_t buft_ddio = ggml_backend_dev_host_buffer_type(ggml_backend_get_device(devices[0].backend));
+            if (buft_ddio == nullptr) {
+                buft_ddio = ggml_backend_cpu_buffer_type();
+            }
+            buf_ddio.reset(ggml_backend_buft_alloc_buffer(buft_ddio, ddio_slots*n_tensors*ddio_stride + 4096));
+            if (!buf_ddio) {
+                throw std::runtime_error("failed to allocate the MoE cache ddio stage slots");
+            }
+            ddio_base = (uint8_t *) GGML_PAD((uintptr_t) ggml_backend_buffer_get_base(buf_ddio.get()), 4096);
+            ddio_left.reset(new std::atomic<int32_t>[ddio_slots]);
+            ddio_fail.reset(new std::atomic<int32_t>[ddio_slots*4]);
+            for (int32_t i = 0; i < ddio_slots; ++i) {
+                ddio_left[i].store(0);
+            }
+            LLAMA_LOG_INFO("%s: ddio: %d reader threads, %d slots, %.2f MiB pinned, chunk %zu KiB\n", __func__,
+                ddio, ddio_slots, ggml_backend_buffer_get_size(buf_ddio.get())/1024.0/1024.0, ddio_chunk/1024);
+        }
+        if (dio > 0) {
+            for (group & g : groups) {
+                if (g.pool.n == 0) {
+                    continue;
+                }
+                g.pool_busy.reset(new std::atomic<int32_t>[g.pool.n]);
+                for (int32_t i = 0; i < g.pool.n; ++i) {
+                    g.pool_busy[i].store(0);
+                }
+                g.pool_dio.assign(g.pool.n, 0);
+                g.pool_d2h.assign(g.pool.n, 0);
+            }
+            LLAMA_LOG_INFO("%s: dio: %d reader threads, %zu files, lookahead = %d (k = %d)\n", __func__, dio, dio_fds.size(), lookahead, lookahead_k);
+        }
+        for (int32_t i = 0; i < std::max(dio, ddio); ++i) {
+            dio_threads.emplace_back([this] { dio_run(); });
+        }
+
         // as weights, the ops that read the banks run on the device and the slot maps are copied with the copy callback
         for (device & d : devices) {
             if (d.buf) {
@@ -972,6 +1290,21 @@ struct llama_moe_cache::impl {
                 ggml_backend_synchronize(d.backend_d2h.get());
             }
         }
+        if (!dio_threads.empty()) {
+            {
+                std::lock_guard<std::mutex> lock(dio_mutex);
+                dio_stop = true;
+            }
+            dio_cv.notify_all();
+            for (auto & t : dio_threads) {
+                t.join();
+            }
+        }
+#ifdef __linux__
+        for (int fd : dio_fds) {
+            close(fd);
+        }
+#endif
         if (ra_thread.joinable()) {
             {
                 std::lock_guard<std::mutex> lock(ra_mutex);
@@ -1167,23 +1500,30 @@ struct llama_moe_cache::impl {
         // pool: take the misses found in the pool out of it, then copy the evicted experts to the pool before their slots are overwritten
         // all on the same stream: an upload from a pool slot is queued before a later copy can reuse that slot
         pool_src.assign(fills.size(), -1);
+        uint64_t d2h_waited = 0; // D2H batches done once backend is synchronized
         size_t n_pool_hit = 0;
         size_t n_pool_put = 0;
         if (g.pool.n > 0) {
             for (size_t i = 0; i < fills.size(); ++i) {
-                pool_src[i] = g.pool.take(g.lru.make_key(il, fills[i].expert));
+                pool_src[i] = pool_take(g, g.lru.make_key(il, fills[i].expert));
                 n_pool_hit += pool_src[i] >= 0;
             }
             // with overlap: evicted experts go D2D to stage slots (fast), the D2H from there runs on backend_d2h while backend uploads
             device & d = devices[g.id];
-            if (d.d2h_pending && (!fills.empty() || !g.lru.evicted.empty())) {
-                // the stage slots and the pool slots written by the last D2H must be ready
+            bool spec_sel = false;
+            for (const auto & [ig, key] : d.spec_unwaited) {
+                spec_sel = spec_sel || (ig == l.ig && g.lru.is_selected(il, key));
+            }
+            if (d.d2h_pending && (!fills.empty() || !g.lru.evicted.empty() || spec_sel)) {
+                // the stage slots, the pool slots written by the last D2H and the selected speculative uploads must be ready
                 ggml_backend_event_wait(backend, d.ev_d2h.get());
+                d2h_waited = d.d2h_seq;
                 d.d2h_pending = false;
+                d.spec_unwaited.clear();
             }
             staged.clear();
             for (size_t i = 0; i < g.lru.evicted.size(); ++i) {
-                const int32_t ps = g.pool.insert(g.lru.evicted[i]);
+                const int32_t ps = pool_insert(g, g.lru.evicted[i]);
                 if (ps < 0) {
                     continue;
                 }
@@ -1212,7 +1552,11 @@ struct llama_moe_cache::impl {
                 ggml_backend_t b2 = d.backend_d2h.get();
                 ggml_backend_event_record(d.ev_stage.get(), backend);
                 ggml_backend_event_wait(b2, d.ev_stage.get());
+                d.d2h_seq++;
                 for (const auto & [ss, ps] : staged) {
+                    if (!g.pool_d2h.empty()) {
+                        g.pool_d2h[ps] = d.d2h_seq;
+                    }
                     for (size_t ip = 0; ip < g.stage_banks.size(); ++ip) {
                         const size_t es = g.stage_banks[ip]->nb[2];
                         ggml_backend_tensor_get_async(b2, g.stage_banks[ip], (uint8_t *) g.pool_banks[ip]->data + ps*es, ss*es, es);
@@ -1223,12 +1567,51 @@ struct llama_moe_cache::impl {
             }
         }
 
+        // ddio: read the misses not in the pool with O_DIRECT, many chunks in flight, into pinned stage slots
+        ddio_src.assign(fills.size(), -1);
+        int32_t n_ddio = 0;
+        if (ddio > 0 && !fills.empty()) {
+            dio_jobs.clear();
+            for (size_t i = 0; i < fills.size() && n_ddio < ddio_slots; ++i) {
+                if (pool_src[i] >= 0) {
+                    continue;
+                }
+                const int32_t k = n_ddio++;
+                ddio_src[i] = k;
+                int32_t n_chunks = 0;
+                for (size_t ip = 0; ip < l.experts.size(); ++ip) {
+                    const ggml_tensor * w = l.experts[ip];
+                    const size_t es  = w->nb[2];
+                    const off_t  off = dio_srcs.at(w).off + (off_t) (fills[i].expert*es);
+                    const off_t  beg = off & ~(off_t) 4095;
+                    const off_t  end = GGML_PAD(off + (off_t) es, 4096);
+                    uint8_t * dst = ddio_base + (k*ddio_nt + ip)*ddio_stride;
+                    ddio_fail[k*4 + ip].store(0, std::memory_order_relaxed);
+                    for (off_t c = beg; c < end; c += ddio_chunk) {
+                        const size_t len  = std::min<off_t>(ddio_chunk, end - c);
+                        const size_t need = std::max<off_t>(0, std::min<off_t>(c + len, off + es) - c);
+                        dio_jobs.push_back({ dio_srcs.at(w).fd, c, len, nullptr, dst + (c - beg), &ddio_left[k], need, &ddio_fail[k*4 + ip] });
+                        n_chunks++;
+                    }
+                }
+                ddio_left[k].store(n_chunks, std::memory_order_relaxed);
+            }
+            if (!dio_jobs.empty()) {
+                {
+                    std::lock_guard<std::mutex> lock(dio_mutex);
+                    dio_queue_hi.insert(dio_queue_hi.end(), dio_jobs.begin(), dio_jobs.end());
+                }
+                dio_cv.notify_all();
+            }
+            stats_ddio_read += n_ddio;
+        }
+
         // mmap'd misses may be on disk: request all of them first, so the reads run in parallel and not one page fault at a time
         if (prefetch && (!fills.empty() || !cpu.empty())) {
             llama_memory_ranges mr;
             for (const ggml_tensor * w : l.experts) {
                 for (size_t i = 0; i < fills.size(); ++i) {
-                    if (pool_src[i] < 0) {
+                    if (pool_src[i] < 0 && ddio_src[i] < 0) {
                         mr.push_back({ (const uint8_t *) w->data + fills[i].expert*w->nb[2], w->nb[2] });
                     }
                 }
@@ -1246,6 +1629,10 @@ struct llama_moe_cache::impl {
             ggml_tensor       * bank = g.banks[ip];
             const size_t expert_size = w->nb[2];
             for (size_t i = 0; i < fills.size();) {
+                if (ddio_src[i] >= 0) {
+                    i++;
+                    continue;
+                }
                 if (pool_src[i] >= 0) {
                     ggml_backend_tensor_set_async(backend, bank, (const uint8_t *) g.pool_banks[ip]->data + pool_src[i]*expert_size, fills[i].slot*expert_size, expert_size);
                     bytes += expert_size;
@@ -1253,13 +1640,39 @@ struct llama_moe_cache::impl {
                     continue;
                 }
                 size_t n = 1;
-                while (i + n < fills.size() && pool_src[i + n] < 0 && fills[i + n].expert == fills[i].expert + (int32_t) n && fills[i + n].slot == fills[i].slot + (int32_t) n) {
+                while (i + n < fills.size() && pool_src[i + n] < 0 && ddio_src[i + n] < 0 && fills[i + n].expert == fills[i].expert + (int32_t) n && fills[i + n].slot == fills[i].slot + (int32_t) n) {
                     n++;
                 }
                 ggml_backend_tensor_set_async(backend, bank, (const uint8_t *) w->data + fills[i].expert*expert_size, fills[i].slot*expert_size, n*expert_size);
                 bytes += n*expert_size;
                 i += n;
             }
+        }
+        // ddio misses, in the order their reads were queued
+        if (n_ddio > 0) {
+            const int64_t t0 = ggml_time_us();
+            for (size_t i = 0; i < fills.size(); ++i) {
+                const int32_t k = ddio_src[i];
+                if (k < 0) {
+                    continue;
+                }
+                while (ddio_left[k].load(std::memory_order_acquire) > 0) {
+                    std::this_thread::yield();
+                }
+                for (size_t ip = 0; ip < l.experts.size(); ++ip) {
+                    const ggml_tensor * w = l.experts[ip];
+                    const size_t es  = w->nb[2];
+                    const off_t  off = dio_srcs.at(w).off + (off_t) (fills[i].expert*es);
+                    const uint8_t * src = ddio_base + (k*ddio_nt + ip)*ddio_stride + (off & 4095);
+                    if (ddio_fail[k*4 + ip].load(std::memory_order_relaxed)) {
+                        src = (const uint8_t *) w->data + fills[i].expert*es;
+                        stats_ddio_fail++;
+                    }
+                    ggml_backend_tensor_set_async(backend, g.banks[ip], src, fills[i].slot*es, es);
+                    bytes += es;
+                }
+            }
+            ddio_wait_us += ggml_time_us() - t0;
         }
         for (int32_t ps : pool_src) {
             if (ps >= 0) {
@@ -1277,6 +1690,10 @@ struct llama_moe_cache::impl {
         if (!fills.empty()) {
             ggml_backend_synchronize(backend);
             st.t_upload_us += ggml_time_us() - t_start_us;
+            if (d2h_waited > 0) {
+                device & d = devices[g.id];
+                d.d2h_done = std::max(d.d2h_done, d2h_waited);
+            }
         }
 #ifdef __linux__
         if (cold) {
@@ -1304,8 +1721,123 @@ struct llama_moe_cache::impl {
         }
 #endif
 
+        if (!g.spec_keys.empty()) {
+            size_t j = 0;
+            for (int32_t key : g.spec_keys) {
+                if (g.lru.key_layer(key) != il) {
+                    g.spec_keys[j++] = key;
+                } else if (g.lru.is_selected(il, key)) {
+                    stats_spec_used++;
+                }
+            }
+            g.spec_keys.resize(j);
+        }
+
+        // upload the predicted experts of the next layer that are in the pool, on the pool stream, after the uploads of this layer
+        if (spec > 0 && it_pred != preds.end()) {
+            device & d = devices[g.id];
+            ggml_backend_t b2 = d.backend_d2h.get();
+            bool queued = false;
+            size_t n = 0;
+            for (const pred & p : it_pred->second) {
+                const int64_t np = ggml_nelements(p.ids);
+                group & gp = groups[layers[p.il].ig];
+                if (p.il == il + 1 && b2 != nullptr && gp.id == g.id && gp.pool.n > 0 && gp.n_stage > 0) {
+                    int32_t n_up = 0;
+                    for (int64_t i = 0; i < np && n_up < spec; ++i) {
+                        const int32_t e = pred_ids[n + i];
+                        if (e < 0 || e >= gp.lru.n_expert || gp.lru.slot_map[p.il][e] < gp.n_slots) {
+                            continue;
+                        }
+                        const int32_t key = gp.lru.make_key(p.il, e);
+                        if (gp.pool.slot_of[key] < 0) {
+                            continue;
+                        }
+                        if (!queued) {
+                            ggml_backend_event_record(d.ev_stage.get(), backend);
+                            ggml_backend_event_wait(b2, d.ev_stage.get());
+                            queued = true;
+                        }
+                        const int32_t ps = pool_take(gp, key);
+                        int32_t ev = -1;
+                        const int32_t s = gp.lru.insert_spec(il, p.il, e, ev);
+                        const int32_t pv = ev >= 0 ? pool_insert(gp, ev) : -1;
+                        for (size_t ip = 0; ip < gp.banks.size(); ++ip) {
+                            ggml_tensor * bank = gp.banks[ip];
+                            const size_t es = bank->nb[2];
+                            if (pv >= 0) {
+                                ggml_backend_tensor_get_async(b2, bank, (uint8_t *) gp.pool_banks[ip]->data + pv*es, s*es, es);
+                            }
+                            ggml_backend_tensor_set_async(b2, bank, (const uint8_t *) gp.pool_banks[ip]->data + ps*es, s*es, es);
+                        }
+                        gp.pool.release(ps);
+                        gp.spec_keys.push_back(key);
+                        d.spec_unwaited.push_back({ layers[p.il].ig, key });
+                        stats_spec_up++;
+                        n_up++;
+                    }
+                    gp.lru.spec_gen++;
+                }
+                n += np;
+            }
+            if (queued) {
+                ggml_backend_event_record(d.ev_d2h.get(), b2);
+                d.d2h_pending = true;
+            }
+        }
+
+        // dio: read the predicted experts of the next layers that are not in VRAM or in the pool into pool slots
+        // all uploads from and copies to pool slots on backend are done here (synchronized above if there were fills)
+        if (dio > 0 && it_pred != preds.end()) {
+            size_t n = 0;
+            dio_jobs.clear();
+            for (const pred & p : it_pred->second) {
+                const layer & lp = layers[p.il];
+                group & gp = groups[lp.ig];
+                device & dp = devices[gp.id];
+                const int64_t np = ggml_nelements(p.ids);
+                for (int64_t i = 0; i < np && gp.pool_busy; ++i) {
+                    const int32_t e = pred_ids[n + i];
+                    if (e < 0 || e >= gp.lru.n_expert || gp.lru.slot_map[p.il][e] < gp.n_slots) {
+                        continue;
+                    }
+                    const int32_t key = gp.lru.make_key(p.il, e);
+                    if (gp.pool.slot_of[key] >= 0) {
+                        continue;
+                    }
+                    const int32_t ps = pool_insert(gp, key);
+                    if (ps < 0) {
+                        continue;
+                    }
+                    if (gp.pool_d2h[ps] > dp.d2h_done) {
+                        // the slot may still be written by a D2H in flight
+                        ggml_backend_synchronize(dp.backend_d2h.get());
+                        dp.d2h_done = dp.d2h_seq;
+                        stats_dio_sync++;
+                    }
+                    gp.pool_busy[ps].store((int32_t) lp.experts.size(), std::memory_order_relaxed);
+                    gp.pool_dio[ps] = 1;
+                    for (size_t ip = 0; ip < lp.experts.size(); ++ip) {
+                        const ggml_tensor * w = lp.experts[ip];
+                        const size_t es = w->nb[2];
+                        const dio_src & src = dio_srcs.at(w);
+                        dio_jobs.push_back({ src.fd, src.off + (off_t) (e*es), es, (const uint8_t *) w->data + e*es, (uint8_t *) gp.pool_banks[ip]->data + ps*es, &gp.pool_busy[ps] });
+                    }
+                    stats_dio_read++;
+                }
+                n += np;
+            }
+            if (!dio_jobs.empty()) {
+                {
+                    std::lock_guard<std::mutex> lock(dio_mutex);
+                    dio_queue.insert(dio_queue.end(), dio_jobs.begin(), dio_jobs.end());
+                }
+                dio_cv.notify_all();
+            }
+        }
+
         // read ahead the predicted experts of the next layers that are not cached
-        if (it_pred != preds.end()) {
+        if (spec == 0 && dio == 0 && it_pred != preds.end()) {
             llama_memory_ranges mr;
             size_t n = 0;
             for (const pred & p : it_pred->second) {
@@ -1356,9 +1888,20 @@ struct llama_moe_cache::impl {
         };
         log("ubatch <= 8", stats_small);
         log("ubatch  > 8", stats_large);
+        if (spec > 0) {
+            LLAMA_LOG_INFO("llama_moe_cache: spec: %zu experts uploaded ahead, %zu of them selected (%.1f%%)\n",
+                stats_spec_up, stats_spec_used, stats_spec_up > 0 ? 100.0*stats_spec_used/stats_spec_up : 0.0);
+        }
         if (pool_size > 0) {
             LLAMA_LOG_INFO("llama_moe_cache: pool: %zu misses read from the pool, %zu evicted experts copied to it\n",
                 stats_small.pool_hits + stats_large.pool_hits, stats_small.pool_put + stats_large.pool_put);
+        }
+        if (ddio > 0) {
+            LLAMA_LOG_INFO("llama_moe_cache: ddio: %zu misses read, %.2f s waiting, %zu failed reads\n", stats_ddio_read, ddio_wait_us/1e6, stats_ddio_fail);
+        }
+        if (dio > 0) {
+            LLAMA_LOG_INFO("llama_moe_cache: dio: %zu experts read, %zu used, %zu evicted unused, %zu waits (%.2f s), %zu syncs, %zu failed reads\n",
+                stats_dio_read, stats_dio_used, stats_dio_unused, stats_dio_wait, dio_wait_us/1e6, stats_dio_sync, stats_dio_fail);
         }
         for (size_t d = 0; d < stats_pred.size(); ++d) {
             LLAMA_LOG_INFO("llama_moe_cache: lookahead %zu: %.1f%% of selected and %.1f%% of misses predicted, %zu prefetched (%zu misses)\n", d + 1,
